@@ -1,0 +1,26 @@
+# Swift / Xcode
+.build/
+.swiftpm/
+*.xcodeproj/xcuserdata/
+xcuserdata/
+DerivedData/
+*.xcuserstate
+
+# Build output
+YTGrab.app/
+
+# Downloads / temp
+*.part
+*.ytdl
+tmp/
+
+# macOS
+.DS_Store
+
+# docs/screenshots/ is intentionally NOT ignored (kept as evidence)
+
+# code-review-graph local index
+.code-review-graph/
+
+# code-review-graph index
+.code-review-graph/

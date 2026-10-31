@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test-lint:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (release)
+        run: swift build -c release
+      - name: Unit tests
+        run: swift test
+        env:
+          YTGRAB_E2E: "0"
+      - name: Install swiftlint
+        run: brew install swiftlint
+      - name: Lint
+        run: swiftlint lint --strict

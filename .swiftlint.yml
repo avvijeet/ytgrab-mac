@@ -1,0 +1,41 @@
+excluded:
+  - .build
+  - scripts
+
+line_length:
+  warning: 120
+  error: 120
+
+function_body_length:
+  warning: 60
+  error: 80
+
+type_body_length:
+  warning: 300
+  error: 400
+
+file_length:
+  warning: 500
+  error: 800
+
+cyclomatic_complexity:
+  warning: 12
+  error: 20
+
+force_try: error
+force_cast: error
+sorted_imports: error
+
+# trailing_comma + opening_brace disabled: swift-format REQUIRES trailing
+# commas in multiline literals and places `{` on its own line after
+# multiline conditions. The tools conflict; swift-format owns style.
+disabled_rules:
+  - trailing_comma
+  - opening_brace
+
+opt_in_rules:
+  - sorted_imports
+  - force_unwrapping
+  - unhandled_throwing_task
+  - unused_import
+  - empty_count
