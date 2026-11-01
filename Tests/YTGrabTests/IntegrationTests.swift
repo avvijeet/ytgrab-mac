@@ -58,7 +58,8 @@ struct IntegrationTests {
         defer { try? FileManager.default.removeItem(atPath: dir) }
         let real = DownloadManager(
             spawner: PosixSpawnSpawner(),
-            defaults: UserDefaults(suiteName: "ytgrab-it1-\(UUID().uuidString)") ?? .standard)
+            defaults: UserDefaults(suiteName: "ytgrab-it1-\(UUID().uuidString)") ?? .standard,
+            historyStore: HistoryStore(fileURL: tempHistoryURL()))
         real.saveDirectory = dir
         let job = real.enqueue(url: testURL, title: "t", quality: .h720)
         let finished = await poll(240) { job.state == .done || job.state == .failed }
@@ -83,7 +84,8 @@ struct IntegrationTests {
         defer { try? FileManager.default.removeItem(atPath: dir) }
         let real = DownloadManager(
             spawner: PosixSpawnSpawner(),
-            defaults: UserDefaults(suiteName: "ytgrab-it2-\(UUID().uuidString)") ?? .standard)
+            defaults: UserDefaults(suiteName: "ytgrab-it2-\(UUID().uuidString)") ?? .standard,
+            historyStore: HistoryStore(fileURL: tempHistoryURL()))
         real.saveDirectory = dir
         let job = real.enqueue(url: testURL, title: "t", quality: .audioM4A)
         let finished = await poll(240) { job.state == .done || job.state == .failed }
@@ -107,7 +109,8 @@ struct IntegrationTests {
         defer { try? FileManager.default.removeItem(atPath: dir) }
         let real = DownloadManager(
             spawner: PosixSpawnSpawner(),
-            defaults: UserDefaults(suiteName: "ytgrab-it3-\(UUID().uuidString)") ?? .standard)
+            defaults: UserDefaults(suiteName: "ytgrab-it3-\(UUID().uuidString)") ?? .standard,
+            historyStore: HistoryStore(fileURL: tempHistoryURL()))
         real.saveDirectory = dir
         let job = real.enqueue(url: testURL, title: "t", quality: .h360)
         // Act the moment a .part appears: guaranteed in-flight state
@@ -141,7 +144,8 @@ struct IntegrationTests {
         defer { try? FileManager.default.removeItem(atPath: dir) }
         let real = DownloadManager(
             spawner: PosixSpawnSpawner(),
-            defaults: UserDefaults(suiteName: "ytgrab-it4-\(UUID().uuidString)") ?? .standard)
+            defaults: UserDefaults(suiteName: "ytgrab-it4-\(UUID().uuidString)") ?? .standard,
+            historyStore: HistoryStore(fileURL: tempHistoryURL()))
         real.saveDirectory = dir
         let job = real.enqueue(url: testURL, title: "t", quality: .h360)
         let started = await poll(60) { !partFiles(in: dir).isEmpty }
@@ -166,7 +170,8 @@ struct IntegrationTests {
         defer { try? FileManager.default.removeItem(atPath: dir) }
         let real = DownloadManager(
             spawner: PosixSpawnSpawner(),
-            defaults: UserDefaults(suiteName: "ytgrab-it5-\(UUID().uuidString)") ?? .standard)
+            defaults: UserDefaults(suiteName: "ytgrab-it5-\(UUID().uuidString)") ?? .standard,
+            historyStore: HistoryStore(fileURL: tempHistoryURL()))
         real.saveDirectory = dir
         let job = real.enqueue(url: testURL, title: "t", quality: .h360)
         let started = await poll(60) { job.percent > 0 }
@@ -179,6 +184,49 @@ struct IntegrationTests {
         #expect(job.state == .done, "err=\(job.errorText ?? "-")")
     }
 
+    @Test("360p download persists to history.json and reloads")
+    func historyE2E() async throws {
+        let dir = NSTemporaryDirectory() + "ytgrab-he-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(
+            atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let store = HistoryStore()  // real ~/Library/Application Support path
+        let real = DownloadManager(
+            spawner: PosixSpawnSpawner(),
+            defaults: UserDefaults(suiteName: "ytgrab-he-\(UUID().uuidString)")
+                ?? .standard,
+            historyStore: store)
+        real.saveDirectory = dir
+        let job = real.enqueue(url: testURL, title: "t", quality: .h360)
+        let finished = await poll(240) { job.state == .done || job.state == .failed }
+        #expect(finished)
+        #expect(job.state == .done, "err=\(job.errorText ?? "-")")
+        guard let path = job.finalPath else {
+            Issue.record("no finalPath")
+            return
+        }
+        real.flushHistory()
+        let data = try Data(contentsOf: store.fileURL)
+        let records = try JSONDecoder().decode([HistoryRecord].self, from: data)
+        #expect(
+            records.contains { $0.id == job.id && $0.finalPath == path },
+            "history.json missing the job entry")
+        let streams = ffprobeStreams(path)
+        #expect(streams.video, "no video stream")
+        #expect(streams.audio, "no audio stream")
+        try FileManager.default.removeItem(atPath: path)
+        // Simulated relaunch: a fresh manager over the same store
+        // reloads the entry as a done history item.
+        let relaunched = DownloadManager(
+            spawner: PosixSpawnSpawner(),
+            defaults: UserDefaults(suiteName: "ytgrab-he2-\(UUID().uuidString)")
+                ?? .standard,
+            historyStore: HistoryStore())
+        let restored = relaunched.jobs.first { $0.id == job.id }
+        #expect(restored?.state == .done)
+        #expect(restored?.finalPath == path)
+    }
+
     @Test("unavailable video fails with readable error")
     func failingURL() async throws {
         let dir = NSTemporaryDirectory() + "ytgrab-it-\(UUID().uuidString)"
@@ -187,7 +235,8 @@ struct IntegrationTests {
         defer { try? FileManager.default.removeItem(atPath: dir) }
         let real = DownloadManager(
             spawner: PosixSpawnSpawner(),
-            defaults: UserDefaults(suiteName: "ytgrab-it6-\(UUID().uuidString)") ?? .standard)
+            defaults: UserDefaults(suiteName: "ytgrab-it6-\(UUID().uuidString)") ?? .standard,
+            historyStore: HistoryStore(fileURL: tempHistoryURL()))
         real.saveDirectory = dir
         let job = real.enqueue(url: badURL, title: "t", quality: .best)
         let finished = await poll(90) { job.state == .done || job.state == .failed }
@@ -325,7 +374,8 @@ struct ContainerE2ETests {
         let manager = DownloadManager(
             spawner: PosixSpawnSpawner(),
             defaults: UserDefaults(
-                suiteName: "ytgrab-ct-\(UUID().uuidString)") ?? .standard)
+                suiteName: "ytgrab-ct-\(UUID().uuidString)") ?? .standard,
+            historyStore: HistoryStore(fileURL: tempHistoryURL()))
         manager.saveDirectory = dir
         manager.settings.container = container
         let job = manager.enqueue(url: testURL, title: "t", quality: .h360)
@@ -356,7 +406,8 @@ struct ContainerE2ETests {
             let manager = DownloadManager(
                 spawner: PosixSpawnSpawner(),
                 defaults: UserDefaults(
-                    suiteName: "ytgrab-st-\(UUID().uuidString)") ?? .standard)
+                    suiteName: "ytgrab-st-\(UUID().uuidString)") ?? .standard,
+                historyStore: HistoryStore(fileURL: tempHistoryURL()))
             manager.saveDirectory = dir
             manager.settings.container = container
             manager.settings.downloadSubtitles = true

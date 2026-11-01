@@ -51,7 +51,7 @@ xattr -dr com.apple.quarantine /Applications/YTGrab.app
 
 | | |
 |---|---|
-| Downloads | ![Downloads tab](docs/screenshots/downloads_tab.png) |
+| Downloads / History | ![Downloads and History tabs](docs/screenshots/downloads_history_tab.png) |
 | Browse | ![Browse tab](docs/screenshots/browse_tab.png) |
 | Settings | ![Settings expanded](docs/screenshots/settings_expanded.png) |
 
@@ -59,12 +59,25 @@ xattr -dr com.apple.quarantine /Applications/YTGrab.app
 
 - Paste a YouTube URL → **Fetch info** → pick quality
   (best / up to the video's real heights / audio-only m4a or mp3)
-- Download queue (max 2 concurrent): progress %, speed, ETA, size,
-  merge/post-processing phase
+- Download queue: concurrency adjustable 1–8 via stepper (default =
+  half the machine's cores, persisted); raising it starts queued jobs
+  immediately. Progress %, speed, ETA, size, per-stream "stream i/n"
+  sublabel for split audio+video downloads
+- Live phases per job: Preparing (extractor/JS-challenge detail),
+  Fetching formats, Downloading, Merging/Processing
 - Per job: Pause (SIGSTOP whole process group), Resume, Stop
   (keeps `.part` for later `--continue`), Restart from zero
-  (`--no-continue --force-overwrites`), Retry, Reveal in Finder, Remove
-- Global: Pause all, Clear finished; children are killed on app quit
+  (`--no-continue --force-overwrites`), Re-download, Reveal in Finder,
+  Remove
+- **Persistent history**: every job (done/failed/cancelled) survives
+  relaunch in `~/Library/Application Support/YTGrab/history.json`
+  (atomic writes, capped at 500 entries); jobs in flight at quit reload
+  as *Interrupted* and can Resume (`--continue` on `.part`) or Restart.
+  Non-active entries live in their own **History** tab; its search
+  field filters on title/URL/path and Clear history removes all
+  non-active entries (confirmed)
+- Global: Pause all (Downloads tab); Clear finished / Clear history
+  (History tab); children are killed on app quit
 - Save folder via NSOpenPanel (default ~/Downloads, persisted)
 - Settings: cookies-from-browser, embed metadata, subtitles with
   editable language list, playlist toggle, container (mp4/mkv/webm)

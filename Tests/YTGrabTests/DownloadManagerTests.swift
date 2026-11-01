@@ -68,12 +68,26 @@ final class FakeSpawner: ProcessSpawner, @unchecked Sendable {
     }
 }
 
+/// Fresh history.json location under a unique temp dir.
+func tempHistoryURL() -> URL {
+    URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent(
+            "ytgrab-hist-\(UUID().uuidString)/history.json")
+}
+
 @MainActor
-func makeManager(spawner: FakeSpawner) -> DownloadManager {
+func makeManager(
+    spawner: FakeSpawner,
+    historyStore: HistoryStore = HistoryStore(fileURL: tempHistoryURL()),
+    maxConcurrent: Int = 2
+) -> DownloadManager {
     let suite = "ytgrab-test-\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suite) ?? .standard
-    let manager = DownloadManager(spawner: spawner, defaults: defaults)
+    let manager = DownloadManager(
+        spawner: spawner, defaults: defaults, historyStore: historyStore)
     manager.saveDirectory = NSTemporaryDirectory()
+    // Pin N so queued/running assertions don't depend on host core count.
+    manager.maxConcurrent = maxConcurrent
     return manager
 }
 

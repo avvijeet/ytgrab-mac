@@ -1,0 +1,5 @@
+yt-dlp -f "bv*[height<=2160]+ba/b[height<=2160]" --merge-output-format mp4 \
+  -P ~/Downloads \
+  -o "%(title)s.%(ext)s" \
+  "https://www.youtube.com/watch?v=ce0XCrEvgI4"
+

@@ -1,22 +1,35 @@
 import Foundation
 import Observation
 
-private struct JobContext {
+/// Per-process bookkeeping; internal so DownloadManager+Output.swift
+/// and DownloadManager+History.swift extensions can share it.
+struct JobContext {
     var process: (any SpawnedProcess)?
     var lastProgressAppliedAt = Date.distantPast
     var stderrLastLine = ""
     var finalPath: String?
     var stopRequested = false
     var removeRequested = false
+    /// Distinct "[download] Destination:" paths seen, in order — one per
+    /// output stream (e.g. .f397.mp4 video + .f251.webm audio).
+    var destinations: [String] = []
+    /// Stream count seeded from "[info] … Downloading N format(s)".
+    var expectedStreams = 0
+    /// Last percent per destination index, for multi-stream averaging.
+    var streamPercents: [Int: Double] = [:]
 }
 
 @MainActor
 @Observable
 final class DownloadManager {
-    /// Ordered queue for display; `jobByID` gives O(1) lookup on the
-    /// per-line progress path instead of scanning the array.
-    private(set) var jobs: [DownloadJob] = []
-    private var jobByID: [UUID: DownloadJob] = [:]
+    /// Ordered newest-first for display; `jobByID` gives O(1) lookup on
+    /// the per-line progress path instead of scanning the array.
+    /// Newest-first means the *last* queued element is the oldest, so
+    /// pump() picks `jobs.last(where: .queued)` to stay FIFO.
+    /// Internal so the history extension (DownloadManager+History.swift)
+    /// can append restored jobs; UI only reads.
+    var jobs: [DownloadJob] = []
+    var jobByID: [UUID: DownloadJob] = [:]
     var settings = DownloadSettings() {
         didSet { persistSettings() }
     }
@@ -25,27 +38,57 @@ final class DownloadManager {
         didSet { defaults.set(saveDirectory, forKey: saveDirectoryKey) }
     }
     let missingTools: [String]
-    let maxConcurrent = 2
+
+    /// Max simultaneous downloads. Default derives from the system
+    /// (half the cores, clamped 1...8); persisted under "maxConcurrent"
+    /// — the same key the UI's @AppStorage writes — and raising it
+    /// immediately starts queued jobs via pump().
+    var maxConcurrent: Int {
+        get {
+            guard
+                let stored = defaults.object(forKey: maxConcurrentKey)
+                    as? Int
+            else { return Self.defaultMaxConcurrent }
+            return Self.clampConcurrent(stored)
+        }
+        set {
+            defaults.set(
+                Self.clampConcurrent(newValue), forKey: maxConcurrentKey)
+            pump()
+        }
+    }
+
+    static var defaultMaxConcurrent: Int {
+        clampConcurrent(ProcessInfo.processInfo.activeProcessorCount / 2)
+    }
+
+    static func clampConcurrent(_ value: Int) -> Int {
+        min(8, max(1, value))
+    }
 
     private let spawner: any ProcessSpawner
     private let defaults: UserDefaults
-    private var contexts: [UUID: JobContext] = [:]
+    let historyStore: HistoryStore
+    var contexts: [UUID: JobContext] = [:]
 
     private let saveDirectoryKey = "saveDirectory"
     private let subtitleLangsKey = "subtitleLangs"
     private let containerKey = "container"
+    private let maxConcurrentKey = "maxConcurrent"
     /// Minimum interval between applied progress updates (~5 UI updates/s).
-    private let progressThrottle: TimeInterval = 0.2
+    let progressThrottle: TimeInterval = 0.2
 
     // Weak registries so the app delegate can reach live managers on quit.
     private static weak var current: DownloadManager?
 
     init(
         spawner: any ProcessSpawner = PosixSpawnSpawner(),
-        defaults: UserDefaults = .standard
+        defaults: UserDefaults = .standard,
+        historyStore: HistoryStore = HistoryStore()
     ) {
         self.spawner = spawner
         self.defaults = defaults
+        self.historyStore = historyStore
         var missing: [String] = []
         if Tooling.ytDLPPath == nil { missing.append("yt-dlp") }
         if Tooling.ffmpegPath == nil { missing.append("ffmpeg") }
@@ -70,6 +113,7 @@ final class DownloadManager {
         {
             settings.container = container
         }
+        restoreHistory()
         Self.current = self
     }
 
@@ -130,18 +174,29 @@ final class DownloadManager {
     func enqueue(url: String, title: String, quality: VideoQuality) -> DownloadJob {
         let job = DownloadJob(
             title: title.isEmpty ? url : title, url: url, quality: quality)
-        jobs.append(job)
+        job.outputDirectory = saveDirectory
+        job.container = settings.container
+        jobs.insert(job, at: 0)  // newest-first
         jobByID[job.id] = job
+        persistHistory()
         pump()
         return job
     }
 
-    private func pump() {
+    /// Fresh job for the same URL/quality — used by "Re-download" on
+    /// finished history entries.
+    @discardableResult
+    func redownload(_ job: DownloadJob) -> DownloadJob {
+        enqueue(url: job.url, title: job.title, quality: job.quality)
+    }
+
+    func pump() {
         let active = jobs.filter {
             $0.state == .running || $0.state == .paused
         }.count
         guard active < maxConcurrent,
-            let next = jobs.first(where: { $0.state == .queued })
+            // jobs is newest-first: last .queued is the oldest → FIFO.
+            let next = jobs.last(where: { $0.state == .queued })
         else { return }
         launch(next, freshStart: false)
         pump()
@@ -153,16 +208,20 @@ final class DownloadManager {
         else {
             job.state = .failed
             job.errorText = "yt-dlp or ffmpeg not found"
+            persistHistory()
             return
         }
         let spec = DownloadSpec(
             url: job.url, quality: job.quality,
-            outputDirectory: saveDirectory, ffmpegDirectory: ffmpegDir,
+            outputDirectory: job.outputDirectory, ffmpegDirectory: ffmpegDir,
             settings: settings, freshStart: freshStart)
         contexts[job.id] = JobContext()
         job.state = .running
         job.phase = .preparing
+        job.phaseDetail = nil
+        job.streamText = ""
         job.errorText = nil
+        persistHistory()
         let jobID = job.id
         do {
             let proc = try spawner.spawn(
@@ -189,6 +248,7 @@ final class DownloadManager {
         } catch {
             job.state = .failed
             job.errorText = String(describing: error)
+            persistHistory()
         }
     }
 
@@ -198,12 +258,14 @@ final class DownloadManager {
         guard job.state == .running else { return }
         contexts[job.id]?.process?.signalGroup(SIGSTOP)
         job.state = .paused
+        persistHistory()
     }
 
     func resumePaused(_ job: DownloadJob) {
         guard job.state == .paused else { return }
         contexts[job.id]?.process?.signalGroup(SIGCONT)
         job.state = .running
+        persistHistory()
     }
 
     /// Terminate the process; partial .part files are kept so a later
@@ -211,6 +273,8 @@ final class DownloadManager {
     func stop(_ job: DownloadJob) {
         if job.state == .queued {
             job.state = .stopped
+            job.finishedAt = Date()
+            persistHistory()
             return
         }
         guard job.state == .running || job.state == .paused else { return }
@@ -249,6 +313,7 @@ final class DownloadManager {
         contexts[job.id] = nil
         jobByID[job.id] = nil
         jobs.removeAll { $0.id == job.id }
+        persistHistory()
         pump()
     }
 
@@ -258,6 +323,8 @@ final class DownloadManager {
         for job in jobs where job.state == .running { pause(job) }
     }
 
+    /// Removes terminal jobs (done/failed/stopped/cancelled); interrupted
+    /// entries survive — they're cleared by clearHistory().
     func clearFinished() {
         let finished: Set<JobState> = [.done, .failed, .stopped, .cancelled]
         for job in jobs where finished.contains(job.state) {
@@ -265,6 +332,19 @@ final class DownloadManager {
             jobByID[job.id] = nil
         }
         jobs.removeAll { finished.contains($0.state) }
+        persistHistory()
+    }
+
+    /// Removes every non-active entry (anything not queued/running/
+    /// paused), including interrupted and terminal history.
+    func clearHistory() {
+        let active: Set<JobState> = [.queued, .running, .paused]
+        for job in jobs where !active.contains(job.state) {
+            contexts[job.id] = nil
+            jobByID[job.id] = nil
+        }
+        jobs.removeAll { !active.contains($0.state) }
+        persistHistory()
     }
 
     func terminateAll() {
@@ -275,77 +355,12 @@ final class DownloadManager {
             }
         }
         contexts.removeAll()
+        // Last durable snapshot before exit: in-flight jobs persist as
+        // running/queued/paused and reload as .interrupted next launch.
+        persistHistory()
+        historyStore.flush()
     }
 
     // MARK: - Output handling
-
-    private func job(withID id: UUID) -> DownloadJob? {
-        jobByID[id]
-    }
-
-    private func handleStdout(jobID: UUID, line: String) {
-        guard let job = job(withID: jobID), contexts[jobID] != nil else { return }
-        if let update = ProgressParser.parse(line) {
-            job.phase = .downloading
-            let now = Date()
-            let isFinal = (update.percent ?? 0) >= 100
-            let lastApplied =
-                contexts[jobID]?.lastProgressAppliedAt
-                ?? .distantPast
-            if isFinal
-                || now.timeIntervalSince(lastApplied) >= progressThrottle
-            {
-                contexts[jobID]?.lastProgressAppliedAt = now
-                if let percent = update.percent { job.percent = percent }
-                if let speed = update.speed { job.speedText = speed }
-                if let eta = update.eta { job.etaText = "ETA \(eta)" }
-                if let total = update.total { job.sizeText = "of \(total)" }
-            }
-        } else if ProgressParser.isPostprocessLine(line) {
-            job.phase = .processing
-        } else if ProgressParser.isFilepathLine(line) {
-            contexts[jobID]?.finalPath = line
-        }
-    }
-
-    private func handleStderr(jobID: UUID, line: String) {
-        guard contexts[jobID] != nil else { return }
-        if !line.isEmpty {
-            contexts[jobID]?.stderrLastLine = line
-        }
-    }
-
-    private func handleExit(jobID: UUID, exit: ProcessExit) {
-        let ctx = contexts[jobID]
-        guard let job = job(withID: jobID) else {
-            contexts[jobID] = nil
-            return
-        }
-        job.phase = nil
-        if ctx?.removeRequested == true {
-            return  // remove() already cleaned up
-        }
-        if ctx?.stopRequested == true {
-            job.state = .stopped
-        } else if exit.succeeded {
-            job.state = .done
-            job.percent = 100
-            job.speedText = ""
-            job.etaText = ""
-            job.finalPath = ctx?.finalPath ?? job.finalPath
-        } else {
-            job.state = .failed
-            let last = ctx?.stderrLastLine ?? ""
-            job.errorText = last.isEmpty ? Self.describe(exit) : last
-        }
-        contexts[jobID]?.process = nil
-        pump()
-    }
-
-    private static func describe(_ exit: ProcessExit) -> String {
-        switch exit {
-        case .exited(let code): return "yt-dlp exited with code \(code)"
-        case .signaled(let sig): return "yt-dlp killed by signal \(sig)"
-        }
-    }
+    // (line dispatch + exit handling live in DownloadManager+Output.swift)
 }

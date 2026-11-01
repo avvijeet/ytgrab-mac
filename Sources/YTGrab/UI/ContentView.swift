@@ -17,7 +17,7 @@ struct ContentView: View {
     @State private var form = DownloadForm()
     @State private var selectedTab: Tab = .downloads
 
-    enum Tab { case downloads, browse }
+    enum Tab { case downloads, browse, history }
 
     var body: some View {
         TabView(selection: $selectedTab) {
@@ -34,6 +34,11 @@ struct ContentView: View {
             )
             .tabItem { Label("Browse", systemImage: "magnifyingglass") }
             .tag(Tab.browse)
+            HistoryView(manager: manager)
+                .tabItem {
+                    Label("History", systemImage: "clock.arrow.circlepath")
+                }
+                .tag(Tab.history)
         }
         .frame(minWidth: 720, minHeight: 480)
     }
@@ -43,6 +48,9 @@ struct DownloadsView: View {
     @Bindable var manager: DownloadManager
     @Bindable var form: DownloadForm
     @AppStorage("settingsExpanded") private var showSettings = false
+    /// Same UserDefaults key DownloadManager.maxConcurrent reads.
+    @AppStorage("maxConcurrent") private var maxConcurrentPref = 0
+    @State private var searchText = ""
 
     private var availableQualities: [VideoQuality] {
         guard let info = form.info else { return VideoQuality.browsePresets }
@@ -67,6 +75,7 @@ struct DownloadsView: View {
             folderRow
             settingsArea
             globalControls
+            searchRow
             jobList
         }
         .padding(16)
@@ -195,15 +204,70 @@ struct DownloadsView: View {
         HStack {
             Button("Pause all") { manager.pauseAll() }
                 .disabled(!manager.jobs.contains { $0.state == .running })
-            Button("Clear finished") { manager.clearFinished() }
             Spacer()
+            Text(statusCounts)
+                .font(.caption).foregroundStyle(.secondary)
         }
+    }
+
+    /// Live counts plus the concurrency limit readout. "X running" in
+    /// the limit counts running+paused — both still hold a slot.
+    private var statusCounts: String {
+        var queued = 0
+        var running = 0
+        var paused = 0
+        var done = 0
+        for job in manager.jobs {
+            switch job.state {
+            case .queued: queued += 1
+            case .running: running += 1
+            case .paused: paused += 1
+            case .done: done += 1
+            default: break
+            }
+        }
+        return "Queued \(queued) · Running \(running) · Paused \(paused)"
+            + " · Done \(done) — Concurrent: \(running + paused) running /"
+            + " \(manager.maxConcurrent) max"
+    }
+
+    private var searchRow: some View {
+        HStack {
+            TextField(
+                "Search title, URL or file path", text: $searchText
+            )
+            .textFieldStyle(.roundedBorder)
+            Stepper(
+                "Concurrent: \(manager.maxConcurrent)",
+                value: Binding(
+                    get: { manager.maxConcurrent },
+                    set: { newValue in
+                        // Persists via @AppStorage("maxConcurrent") and
+                        // pumps queued jobs when the limit is raised.
+                        maxConcurrentPref = newValue
+                        manager.maxConcurrent = newValue
+                    }),
+                in: 1...8)
+        }
+    }
+
+    /// Active jobs (queued/running/paused); everything else is History.
+    private var activeJobs: [DownloadJob] {
+        let active: Set<JobState> = [.queued, .running, .paused]
+        return manager.jobs.filter { active.contains($0.state) }
+    }
+
+    /// O(n) substring filter over title, URL and finalPath.
+    private var filteredJobs: [DownloadJob] {
+        let query = searchText.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty else { return activeJobs }
+        return activeJobs.filter { $0.matches(query) }
     }
 
     private var jobList: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(manager.jobs) { job in
+                ForEach(filteredJobs) { job in
                     JobRowView(job: job, manager: manager)
                     Divider()
                 }
@@ -275,6 +339,10 @@ struct JobRowView: View {
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(minWidth: 110, alignment: .leading)
             }
+            if job.state == .interrupted, let error = job.errorText {
+                Text(error)
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             HStack(spacing: 8) {
                 Text(progressDetail).font(.caption).foregroundStyle(.secondary)
                 Spacer()
@@ -288,6 +356,7 @@ struct JobRowView: View {
         if job.state == .running && job.phase == .downloading {
             return [
                 String(format: "%.1f%%", job.percent),
+                job.streamText,
                 job.speedText, job.etaText, job.sizeText,
             ].filter { !$0.isEmpty }.joined(separator: " · ")
         }
@@ -314,8 +383,11 @@ struct JobRowView: View {
         if job.state != .running && job.state != .paused {
             Button("Restart") { manager.restart(job) }
         }
+        if job.state == .done {
+            Button("Re-download") { manager.redownload(job) }
+        }
         if let path = job.finalPath {
-            Button("Reveal") {
+            Button("Reveal in Finder") {
                 NSWorkspace.shared.activateFileViewerSelecting(
                     [URL(fileURLWithPath: path)])
             }
